@@ -1,239 +1,224 @@
 import streamlit as st
-import google.generativeai as genai
 import pandas as pd
+import google.generativeai as genai
 from io import BytesIO
-import docx
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-import time
-import json
-import re
-from pypdf import PdfReader
 
 # --- CẤU HÌNH TRANG ---
-st.set_page_config(page_title="V12.1 - Hệ Thống Ra Đề Pro (Fix)", layout="wide", page_icon="🛠️")
-st.title("🛠️ Hệ Thống Ra Đề Thi V12.1 (Fixed Reading)")
-st.caption("✅ Đã khôi phục khả năng đọc Bảng/Ma trận. ✅ Giữ tính năng tách Đáp án.")
+st.set_page_config(page_title="Trợ Lý Ra Đề Thi Tiều Học", page_icon="📝", layout="wide")
+
+# --- 1. GIẢ LẬP CƠ SỞ DỮ LIỆU (DATABASE) CHƯƠNG TRÌNH 2018 ---
+# Trong thực tế, dữ liệu này nên được lưu ở file Excel hoặc JSON riêng và load vào.
+# Ở đây tôi tạo mẫu chi tiết cho Lớp 4 - Bộ Kết nối tri thức.
+DB_CURRICULUM = {
+    "Lớp 4": {
+        "Kết nối tri thức": {
+            "Toán": {
+                "icon": "➗",
+                "topics": {
+                    "Số và phép tính": {
+                        "Bài 1: Ôn tập các số đến 100 000": [
+                            "Đọc, viết được các số đến 100 000",
+                            "Nhận biết được cấu tạo thập phân của số",
+                            "So sánh, xếp thứ tự các số trong phạm vi 100 000"
+                        ],
+                        "Bài 10: Số có sáu chữ số": [
+                            "Đọc, viết được các số có sáu chữ số",
+                            "Hiểu được hàng và lớp của số có sáu chữ số"
+                        ]
+                    },
+                    "Hình học": {
+                        "Bài 23: Góc nhọn, góc tù, góc bẹt": [
+                            "Nhận biết được góc nhọn, góc tù, góc bẹt",
+                            "Sử dụng thước đo góc để đo độ lớn góc"
+                        ]
+                    }
+                }
+            },
+            "Tiếng Việt": {
+                "icon": "📖",
+                "topics": {
+                    "Đọc hiểu văn bản": {
+                        "Chủ điểm: Mỗi người một vẻ": [
+                            "Nhận biết được các chi tiết tiêu biểu trong bài đọc",
+                            "Hiểu nội dung chính, ý nghĩa của bài đọc",
+                            "Liên hệ nội dung bài đọc với bản thân"
+                        ]
+                    },
+                    "Luyện từ và câu": {
+                        "Danh từ": [
+                            "Nhận biết được danh từ trong câu",
+                            "Phân loại được danh từ chỉ người, vật, hiện tượng"
+                        ],
+                         "Động từ": [
+                            "Nhận biết được động từ chỉ hoạt động, trạng thái",
+                        ]
+                    }
+                }
+            }
+        },
+        "Cánh Diều": {
+             "Toán": { "icon": "📐", "topics": {"Đang cập nhật...": {}}} # Placeholder
+        },
+         "Chân trời sáng tạo": {
+             "Toán": { "icon": "📐", "topics": {"Đang cập nhật...": {}}} # Placeholder
+        }
+    },
+    "Lớp 3": { "Kết nối tri thức": {} }, # Placeholder
+    "Lớp 5": { "Kết nối tri thức": {} }  # Placeholder
+}
+
+# --- XỬ LÝ SESSION STATE (LƯU TRẠNG THÁI) ---
+if 'exam_questions' not in st.session_state:
+    st.session_state['exam_questions'] = [] # Danh sách câu hỏi đã chọn
+if 'current_generated_question' not in st.session_state:
+    st.session_state['current_generated_question'] = "" # Câu hỏi vừa sinh ra (chưa lưu)
+
+# --- SIDEBAR: CẤU HÌNH API & CHỌN MÔN ---
+with st.sidebar:
+    st.header("⚙️ Cấu hình & Dữ liệu")
+    api_key = st.text_input("Nhập Gemini API Key", type="password")
+    
+    st.divider()
+    
+    # Menu chọn phân cấp (Cascading Dropdown)
+    selected_grade = st.selectbox("Chọn Lớp", list(DB_CURRICULUM.keys()))
+    
+    available_books = list(DB_CURRICULUM[selected_grade].keys())
+    selected_book = st.selectbox("Chọn Bộ Sách", available_books)
+    
+    available_subjects = list(DB_CURRICULUM[selected_grade][selected_book].keys())
+    if available_subjects:
+        selected_subject = st.selectbox("Chọn Môn Học", available_subjects)
+        subject_icon = DB_CURRICULUM[selected_grade][selected_book][selected_subject].get('icon', '')
+    else:
+        selected_subject = None
+        subject_icon = ""
+
+# --- GIAO DIỆN CHÍNH ---
+st.title(f"{subject_icon} HỆ THỐNG RA ĐỀ THI - {selected_subject or '...'}")
 st.markdown("---")
 
-# ==============================================================================
-# 1. TOOLKIT: XỬ LÝ JSON & ĐỌC FILE (KHÔI PHỤC TỪ V11)
-# ==============================================================================
-def extract_json_robust(text):
-    """Trích xuất JSON an toàn"""
-    try:
-        match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
-        if match: return json.loads(match.group(0))
-        return None
-    except: return None
-
-def read_input_file_robust(file):
-    """
-    Hàm đọc file mạnh mẽ (Lấy từ V11 sang)
-    Đọc được text trong Table của Word -> Quan trọng cho Ma trận
-    """
-    try:
-        if file.name.endswith('.xlsx'):
-            df = pd.read_excel(file)
-            return df.to_string()
-        elif file.name.endswith('.pdf'):
-            reader = PdfReader(file)
-            return "".join([page.extract_text() for page in reader.pages])
-        elif file.name.endswith('.docx'):
-            doc = docx.Document(file)
-            full_text = []
-            # 1. Đọc đoạn văn thường
-            for para in doc.paragraphs:
-                full_text.append(para.text)
-            # 2. QUAN TRỌNG: Đọc nội dung trong Bảng (Ma trận nằm ở đây)
-            for table in doc.tables:
-                for row in table.rows:
-                    # Nối các cột bằng dấu | để AI hiểu cấu trúc hàng
-                    row_data = " | ".join([cell.text.strip() for cell in row.cells])
-                    full_text.append(row_data)
-            return "\n".join(full_text)
-    except Exception as e:
-        st.error(f"Lỗi đọc file: {e}")
-        return ""
-
-# ==============================================================================
-# 2. AI ENGINE (GIỮ NGUYÊN LOGIC V12)
-# ==============================================================================
-def call_ai_json(api_key, prompt):
-    genai.configure(api_key=api_key)
-    try:
-        # Tăng token để tránh bị cắt giữa chừng
-        model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
-        res = model.generate_content(prompt)
-        return extract_json_robust(res.text)
-    except: return None
-
-def step1_parse_matrix(txt, api_key):
-    prompt = f"""
-    Bạn là chuyên gia khảo thí. Hãy phân tích ma trận đề thi sau thành JSON List.
-    Dữ liệu đầu vào là text được trích xuất từ bảng, các cột ngăn cách bởi dấu "|".
+if selected_subject and api_key:
+    # Lấy dữ liệu chi tiết của môn đã chọn
+    subject_data = DB_CURRICULUM[selected_grade][selected_book][selected_subject]["topics"]
     
-    INPUT DATA:
-    {txt[:25000]}
+    col1, col2 = st.columns([1, 2])
     
-    OUTPUT JSON FORMAT:
-    [
-      {{
-        "topic": "Tên chủ đề/bài học", 
-        "yccd": "Yêu cầu cần đạt (nếu có)", 
-        "type": "TN" (Trắc nghiệm) | "DS" (Đúng/Sai) | "NC" (Nối cột) | "DK" (Điền khuyết) | "TL" (Tự luận),
-        "level": "Biết/Hiểu/Vận dụng", 
-        "points": "Số điểm"
-      }}
-    ]
-    """
-    return call_ai_json(api_key, prompt)
-
-def step2_generate_question_v12(item, context, api_key, q_index):
-    subject = context.get('subject', 'Môn học')
-    grade = context.get('grade', '')
-    q_type = item.get('type', 'TN')
-    
-    # Prompt động theo loại câu hỏi
-    format_guide = "Trắc nghiệm 4 lựa chọn A,B,C,D"
-    if q_type == "DS": format_guide = "Đúng/Sai với 4 ý a,b,c,d"
-    elif q_type == "NC": format_guide = "Nối cột A và cột B"
-    elif q_type == "DK": format_guide = "Điền từ vào chỗ trống '......'"
-    elif q_type == "TL": format_guide = "Tự luận ngắn"
-
-    prompt = f"""
-    Soạn câu hỏi thi {subject} {grade}.
-    - Chủ đề: {item.get('topic')}
-    - Yêu cầu: {item.get('yccd')}
-    - Dạng: {q_type} ({format_guide})
-    - Mức độ: {item.get('level')}
-    
-    OUTPUT JSON:
-    {{
-        "question_content": "Nội dung câu hỏi để in đề (Không kèm đáp án)",
-        "answer_key": "Đáp án chi tiết (để in trang đáp án)"
-    }}
-    """
-    return call_ai_json(api_key, prompt)
-
-# ==============================================================================
-# 3. WORD EXPORT (V12)
-# ==============================================================================
-def create_docx_v12(questions, school, exam, context, time_limit):
-    doc = docx.Document()
-    style = doc.styles['Normal']; font = style.font
-    font.name = 'Times New Roman'; font.size = Pt(13)
-    
-    # Header
-    tbl = doc.add_table(rows=1, cols=2)
-    tbl.autofit = False; tbl.columns[0].width = Cm(7); tbl.columns[1].width = Cm(9)
-    p1 = tbl.cell(0, 0).paragraphs[0]; p1.add_run(f"{school.upper()}\n").bold = True; p1.add_run("ĐỀ KIỂM TRA").bold = False; p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p2 = tbl.cell(0, 1).paragraphs[0]; p2.add_run(f"{exam.upper()}\n").bold = True; p2.add_run(f"Môn: {context['subject']} - {context['grade']}\n").bold = True; p2.add_run(f"Thời gian: {time_limit} phút").italic = True; p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph("\n")
-    
-    # Body
-    for idx, q in enumerate(questions):
-        p = doc.add_paragraph()
-        p.add_run(f"Câu {idx+1}: ({q['points']} điểm) [{q['level']}] ").bold = True
-        
-        lines = q['content'].split('\n')
-        for line in lines:
-            if line.strip(): doc.add_paragraph(line.strip())
-        doc.add_paragraph("")
-
-    # Footer (Đáp án)
-    doc.add_page_break()
-    doc.add_paragraph("ĐÁP ÁN VÀ HƯỚNG DẪN CHẤM").alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
-    table = doc.add_table(rows=1, cols=2)
-    table.style = 'Table Grid'
-    hdr = table.rows[0].cells; hdr[0].text = 'Câu'; hdr[1].text = 'Đáp án'
-    for idx, q in enumerate(questions):
-        row = table.add_row().cells
-        row[0].text = str(idx+1)
-        row[1].text = q.get('answer', '')
-
-    bio = BytesIO(); doc.save(bio); return bio
-
-# ==============================================================================
-# 4. MAIN APP
-# ==============================================================================
-with st.sidebar:
-    st.header("⚙️ V12.1 Config"); api_key = st.text_input("Gemini API Key", type="password")
-
-st.subheader("1. Tải lên Ma trận")
-uploaded_file = st.file_uploader("Upload .docx, .xlsx, .pdf", type=['docx', 'xlsx', 'pdf'])
-
-if 'ctx' not in st.session_state: st.session_state['ctx'] = {}
-
-if uploaded_file:
-    # 1. Đọc file ngay lập tức
-    if 'raw_text' not in st.session_state:
-        with st.spinner("Đang đọc file..."):
-            st.session_state['raw_text'] = read_input_file_robust(uploaded_file)
-            # Debug: In ra độ dài text để biết có đọc được không
-            st.caption(f"Đã đọc được: {len(st.session_state['raw_text'])} ký tự.")
-    
-    # 2. Auto Detect (Chạy 1 lần)
-    if not st.session_state['ctx'] and api_key and st.session_state['raw_text']:
-        with st.spinner("Đang nhận diện Môn & Lớp..."):
-            # Lấy mẫu text đầu để detect
-            sample = st.session_state['raw_text'][:3000]
-            prompt = f"Tìm Môn học và Lớp trong text này. Trả về JSON {{'subject': '...', 'grade': '...'}}. Text: {sample}"
-            res = call_ai_json(api_key, prompt)
-            if res: st.session_state['ctx'] = res
-            else: st.session_state['ctx'] = {'subject': '', 'grade': ''} # Fallback
-
-    # 3. Giao diện nhập liệu (Luôn hiện để user sửa nếu AI sai)
-    c1, c2 = st.columns(2)
-    sub = c1.text_input("Môn học", value=st.session_state['ctx'].get('subject', ''))
-    gra = c2.text_input("Lớp", value=st.session_state['ctx'].get('grade', ''))
-    
-    # Cập nhật ngược lại session
-    st.session_state['ctx']['subject'] = sub
-    st.session_state['ctx']['grade'] = gra
-    
-    c3, c4, c5 = st.columns(3)
-    sch = c3.text_input("Trường", "TRƯỜNG TH...")
-    exa = c4.text_input("Kỳ thi", "CUỐI HỌC KỲ...")
-    tim = c5.number_input("Phút", 35)
-
-    if st.button("🚀 TẠO ĐỀ NGAY", type="primary"):
-        if not api_key: st.error("Thiếu API Key"); st.stop()
-        
-        st_status = st.status("Đang xử lý...", expanded=True)
-        try:
-            # B1: Parse
-            st_status.write("🛠 Phân tích cấu trúc ma trận...")
-            blueprint = step1_parse_matrix(st.session_state['raw_text'], api_key)
+    with col1:
+        st.subheader("1. Thiết lập câu hỏi")
+        with st.container(border=True):
+            # Chọn Chủ đề & Bài học
+            selected_topic_group = st.selectbox("Chủ đề / Mạch nội dung", list(subject_data.keys()))
             
-            if blueprint:
-                st_status.write(f"✅ Tìm thấy {len(blueprint)} câu hỏi.")
-                bar = st.progress(0)
-                final_qs = []
+            lessons_map = subject_data[selected_topic_group]
+            selected_lesson = st.selectbox("Bài học", list(lessons_map.keys()))
+            
+            # Chọn YCCĐ (Dữ liệu từ Database)
+            yccds = lessons_map[selected_lesson]
+            selected_yccd = st.selectbox("Yêu cầu cần đạt (YCCĐ)", yccds)
+            
+            st.divider()
+            
+            # Các thông số kỹ thuật khác
+            q_type = st.selectbox("Dạng câu hỏi", ["Trắc nghiệm (4 đáp án)", "Tự luận", "Đúng/Sai", "Điền khuyết", "Ghép nối"])
+            q_level = st.selectbox("Mức độ (TT27)", ["Mức 1: Nhận biết", "Mức 2: Thông hiểu", "Mức 3: Vận dụng"])
+            q_score = st.number_input("Điểm số", min_value=0.25, step=0.25, value=1.0)
+            
+            btn_generate = st.button("✨ TẠO CÂU HỎI (DRAFT)", use_container_width=True, type="primary")
+
+    with col2:
+        st.subheader("2. Xem trước & Chỉnh sửa")
+        
+        # LOGIC GỌI GEMINI
+        if btn_generate:
+            try:
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel('gemini-1.5-flash')
                 
-                # B2: Loop generate
-                for i, item in enumerate(blueprint):
-                    st_status.write(f"✍️ Đang viết câu {i+1}: {item.get('topic')}...")
-                    res = step2_generate_question_v12(item, st.session_state['ctx'], api_key, i+1)
-                    if res:
-                        final_qs.append({
-                            'points': item.get('points', '1'),
-                            'level': item.get('level', ''),
-                            'content': res.get('question_content', ''),
-                            'answer': res.get('answer_key', '')
-                        })
-                    bar.progress((i+1)/len(blueprint))
+                prompt = f"""
+                Đóng vai giáo viên tiểu học Việt Nam. Hãy tạo 1 câu hỏi kiểm tra đánh giá.
+                - Môn: {selected_subject} - Lớp: {selected_grade} - Bộ sách: {selected_book}
+                - Bài: {selected_lesson}
+                - Yêu cầu cần đạt: {selected_yccd}
+                - Dạng: {q_type}
+                - Mức độ: {q_level}
                 
-                # B3: Export
-                st_status.update(label="Hoàn tất!", state="complete", expanded=False)
-                doc_file = create_docx_v12(final_qs, sch, exa, st.session_state['ctx'], tim)
+                Yêu cầu định dạng output:
+                - Chỉ xuất nội dung câu hỏi và đáp án (nếu có).
+                - Không giải thích dài dòng.
+                - Nếu là trắc nghiệm, hãy đánh dấu đáp án đúng.
+                """
                 
-                st.download_button("📥 Tải File Word (.docx)", doc_file, "De_thi_V12.1.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
+                with st.spinner("Đang suy nghĩ..."):
+                    response = model.generate_content(prompt)
+                    st.session_state['current_generated_question'] = response.text
+            except Exception as e:
+                st.error(f"Lỗi API: {e}")
+
+        # Khu vực hiển thị kết quả sinh ra để người dùng sửa
+        if st.session_state['current_generated_question']:
+            with st.container(border=True):
+                # Text area cho phép giáo viên chỉnh sửa trực tiếp
+                final_content = st.text_area(
+                    "Nội dung câu hỏi (Bạn có thể sửa lại trước khi thêm)",
+                    value=st.session_state['current_generated_question'],
+                    height=200
+                )
                 
-            else:
-                st_status.update(label="Lỗi đọc ma trận", state="error")
-                st.error("AI không hiểu file này. Hãy kiểm tra lại format ma trận.")
-                
-        except Exception as e:
-            st.error(f"Lỗi: {e}")
+                c1, c2, c3 = st.columns([1, 1, 2])
+                with c1:
+                    if st.button("Làm lại câu khác 🔄"):
+                         # Logic kích hoạt lại nút generate (cần click lại nút Tạo bên trái thực tế)
+                         st.info("Hãy bấm nút 'TẠO CÂU HỎI' bên trái để sinh câu mới.")
+                with c2:
+                    if st.button("Thêm vào đề ✅", type="primary"):
+                        # Lưu vào Session State
+                        new_q = {
+                            "STT": len(st.session_state['exam_questions']) + 1,
+                            "Tên bài": selected_lesson,
+                            "YCCĐ": selected_yccd,
+                            "Dạng": q_type,
+                            "Mức độ": q_level,
+                            "Điểm": q_score,
+                            "Nội dung": final_content
+                        }
+                        st.session_state['exam_questions'].append(new_q)
+                        st.success("Đã thêm vào danh sách!")
+                        # Clear nội dung tạm
+                        st.session_state['current_generated_question'] = ""
+                        st.rerun()
+
+    # --- PHẦN 3: BẢNG THỐNG KÊ & XUẤT FILE ---
+    st.markdown("---")
+    st.subheader("3. Ma trận đề thi & Xuất file")
+
+    if len(st.session_state['exam_questions']) > 0:
+        df = pd.DataFrame(st.session_state['exam_questions'])
+        
+        # Hiển thị bảng đẹp
+        st.dataframe(df.style.format({"Điểm": "{:.2f}"}), use_container_width=True)
+        
+        col_act1, col_act2 = st.columns([1, 5])
+        with col_act1:
+            if st.button("🗑️ Xóa toàn bộ"):
+                st.session_state['exam_questions'] = []
+                st.rerun()
+        
+        with col_act2:
+            # Giả lập xuất Word (Trong thực tế dùng thư viện python-docx)
+            # Ở đây xuất CSV để demo tính năng tải xuống
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Tải xuống đề thi (Excel/CSV)",
+                data=csv,
+                file_name='de_thi_tieu_hoc.csv',
+                mime='text/csv',
+                type="primary"
+            )
+            st.info("*Lưu ý: Tính năng xuất file Word (.docx) định dạng đẹp sẽ được tích hợp bằng thư viện `python-docx` trong bản chính thức.*")
+            
+    else:
+        st.info("Chưa có câu hỏi nào trong đề. Hãy thêm câu hỏi ở trên.")
+
+else:
+    st.warning("Vui lòng nhập API Key và chọn đầy đủ thông tin Môn học để bắt đầu.")
