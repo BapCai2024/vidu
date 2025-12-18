@@ -1,24 +1,63 @@
 import streamlit as st
+import google.generativeai as genai
 import pandas as pd
 from io import BytesIO
 import docx
 from pypdf import PdfReader
-import google.generativeai as genai
+import time
 
-# Cấu hình trang
-st.set_page_config(page_title="Gemini Exam Generator", layout="wide")
+# --- CẤU HÌNH TRANG ---
+st.set_page_config(page_title="AI Exam Generator (Fix Lỗi)", layout="wide")
 
-st.title("🎓 Tool Hỗ Trợ Ra Đề Thi Tiểu Học (Gemini)")
+st.title("🎓 Tool Tạo Đề Thi Từ Ma Trận (Phiên bản Fix Lỗi 404/429)")
 st.markdown("---")
 
-# Sidebar: Nhập API Key
-with st.sidebar:
-    st.header("Cấu hình")
-    api_key = st.text_input("Nhập Google Gemini API Key", type="password")
-    st.info("Lấy key miễn phí tại: aistudio.google.com")
+# --- 1. HÀM XỬ LÝ API THÔNG MINH (TRÍCH TỪ FILE 7h.py) ---
+def generate_content_with_rotation(api_key, prompt):
+    """
+    Hàm này tự động tìm model khả dụng để tránh lỗi 404 và 429.
+    Ưu tiên: Flash -> Pro -> Các model khác.
+    """
+    genai.configure(api_key=api_key)
+    try:
+        # Lấy danh sách tất cả model mà key này được phép dùng
+        all_models = list(genai.list_models())
+    except Exception as e:
+        return f"Lỗi kết nối hoặc API Key sai: {e}", None
 
-# Hàm đọc nội dung từ file
+    # Lọc ra các model hỗ trợ tạo văn bản (generateContent)
+    valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
+    
+    if not valid_models:
+        return "Lỗi: API Key đúng nhưng không tìm thấy model nào hỗ trợ tạo văn bản.", None
+
+    # Sắp xếp độ ưu tiên: Flash > Pro > Khác
+    priority_order = []
+    for m in valid_models:
+        if 'flash' in m.lower() and '1.5' in m: priority_order.append(m)
+    for m in valid_models:
+        if 'pro' in m.lower() and '1.5' in m and m not in priority_order: priority_order.append(m)
+    for m in valid_models:
+        if m not in priority_order: priority_order.append(m)
+
+    last_error = ""
+    # Thử chạy lần lượt từng model
+    for model_name in priority_order:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text, model_name # Trả về kết quả và tên model đã dùng
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(1) # Nghỉ 1 chút trước khi thử model tiếp theo
+            continue
+
+    return f"Đã thử tất cả model nhưng đều thất bại. Lỗi cuối cùng: {last_error}", None
+
+# --- 2. CÁC HÀM HỖ TRỢ ĐỌC FILE & XUẤT WORD ---
+
 def read_file(uploaded_file):
+    """Đọc nội dung file upload (PDF, Word, Excel)"""
     text_content = ""
     try:
         if uploaded_file.name.endswith('.pdf'):
@@ -31,59 +70,24 @@ def read_file(uploaded_file):
                 text_content += para.text + "\n"
         elif uploaded_file.name.endswith('.xlsx'):
             df = pd.read_excel(uploaded_file)
+            # Chuyển Excel thành text để AI đọc
             text_content = df.to_string()
     except Exception as e:
         return f"Lỗi đọc file: {e}"
     return text_content
 
-# Hàm gọi Gemini tạo đề
-def generate_exam(matrix_text, topic):
-    if not api_key:
-        return None
-    
-    # Cấu hình Gemini
-    try:
-        genai.configure(api_key=api_key)
-        
-        # --- SỬA LỖI TẠI ĐÂY: Dùng model 'gemini-pro' thay vì 'gemini-1.5-flash' ---
-        model = genai.GenerativeModel('gemini-pro') 
-        
-        # Prompt (Câu lệnh)
-        prompt = f"""
-        Bạn là một giáo viên tiểu học giỏi. Hãy đóng vai chuyên gia soạn đề thi.
-        Dựa vào MA TRẬN ĐỀ THI được cung cấp dưới đây, hãy soạn thảo một đề thi hoàn chỉnh.
-
-        THÔNG TIN ĐẦU VÀO (MA TRẬN):
-        {matrix_text}
-
-        YÊU CẦU CỤ THỂ:
-        1. Chủ đề/Môn học: {topic}
-        2. Cấu trúc trả về phải gồm 2 phần rõ ràng:
-           - PHẦN 1: ĐỀ THI (Gồm các câu hỏi trắc nghiệm hoặc tự luận tùy theo ma trận).
-           - PHẦN 2: ĐÁP ÁN VÀ THANG ĐIỂM CHI TIẾT.
-        3. Đảm bảo nội dung phù hợp với lứa tuổi tiểu học, ngôn ngữ trong sáng, dễ hiểu.
-        4. Trình bày đẹp, phân tách các câu hỏi rõ ràng.
-        """
-
-        # Gọi API
-        with st.spinner("Gemini đang suy nghĩ và soạn đề..."):
-            response = model.generate_content(prompt)
-            return response.text
-
-    except Exception as e:
-        st.error(f"Lỗi kết nối Gemini: {e}")
-        return None
-
-# Hàm tạo file Word
-def create_docx(exam_text):
+def create_docx(exam_text, topic):
     doc = docx.Document()
-    doc.add_heading('ĐỀ THI TIỂU HỌC', 0)
+    # Cài đặt font chữ cơ bản
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Times New Roman'
+    font.size = docx.shared.Pt(13)
     
-    # Xử lý text để đưa vào word
-    # Thay thế các ký tự markdown cơ bản để word đỡ lỗi
-    clean_text = exam_text.replace("**", "").replace("##", "")
+    doc.add_heading(f'ĐỀ THI: {topic.upper()}', 0)
     
-    for line in clean_text.split('\n'):
+    # Xử lý xuống dòng để văn bản trong Word đẹp hơn
+    for line in exam_text.split('\n'):
         if line.strip():
             doc.add_paragraph(line)
     
@@ -91,54 +95,75 @@ def create_docx(exam_text):
     doc.save(bio)
     return bio
 
-# --- GIAO DIỆN CHÍNH ---
+# --- 3. GIAO DIỆN CHÍNH (TAB 1) ---
 
-tab1, tab2, tab3 = st.tabs(["📂 Tab 1: Tạo Đề Từ Ma Trận", "⚙️ Tab 2: Phát triển sau", "📊 Tab 3: Phát triển sau"])
+with st.sidebar:
+    st.header("Cấu hình")
+    api_key = st.text_input("Nhập Google Gemini API Key", type="password")
+    st.info("Code này sẽ tự động tìm model phù hợp (Flash/Pro) để tránh lỗi.")
 
-with tab1:
-    col1, col2 = st.columns([1, 2])
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.subheader("1. Nhập liệu")
+    uploaded_file = st.file_uploader("Upload Ma Trận (PDF, Excel, Word)", type=['pdf', 'docx', 'xlsx'])
+    exam_topic = st.text_input("Nhập tên môn/chủ đề (VD: Toán lớp 4 Giữa kì 1)")
     
-    with col1:
-        st.subheader("1. Input")
-        uploaded_file = st.file_uploader("Upload Ma Trận (PDF, Excel, Word)", type=['pdf', 'docx', 'xlsx'])
-        exam_topic = st.text_input("Nhập tên môn/chủ đề (VD: Tiếng Việt lớp 4)")
-        
-        generate_btn = st.button("🚀 Phân tích & Tạo đề")
+    btn_generate = st.button("🚀 Phân tích & Tạo đề", type="primary")
 
-        if generate_btn:
-            if not uploaded_file:
-                st.warning("Vui lòng upload file ma trận trước.")
-            elif not api_key:
-                st.warning("Vui lòng nhập Gemini API Key bên tay trái.")
-            else:
-                # Đọc file
-                matrix_content = read_file(uploaded_file)
-                # Gọi AI
-                generated_content = generate_exam(matrix_content, exam_topic)
-                
-                if generated_content:
-                    st.session_state['result'] = generated_content
-                    st.success("Đã tạo xong! Mời xem kết quả bên cạnh.")
-
-    with col2:
-        st.subheader("2. Kết quả & Chỉnh sửa")
-        
-        if 'result' in st.session_state:
-            # Cho phép chỉnh sửa trực tiếp
-            edited_content = st.text_area(
-                "Nội dung đề thi (Sửa trực tiếp tại đây):",
-                value=st.session_state['result'],
-                height=600
-            )
-            
-            st.subheader("3. Tải xuống")
-            docx_file = create_docx(edited_content)
-            
-            st.download_button(
-                label="📥 Tải xuống file Word (.docx)",
-                data=docx_file.getvalue(),
-                file_name=f"De_thi_Gemini.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+    if btn_generate:
+        if not uploaded_file:
+            st.warning("Vui lòng upload file ma trận.")
+        elif not api_key:
+            st.warning("Vui lòng nhập API Key.")
         else:
-            st.info("👈 Hãy upload file và bấm nút tạo đề để xem kết quả tại đây.")
+            with st.spinner("AI đang đọc file và tìm model phù hợp..."):
+                # 1. Đọc file
+                matrix_content = read_file(uploaded_file)
+                
+                # 2. Tạo Prompt
+                prompt = f"""
+                Bạn là một giáo viên tiểu học giỏi. Hãy đóng vai chuyên gia soạn đề thi.
+                Dựa vào MA TRẬN ĐỀ THI được cung cấp dưới đây, hãy soạn thảo một đề thi hoàn chỉnh.
+
+                THÔNG TIN MA TRẬN:
+                {matrix_content}
+
+                YÊU CẦU:
+                1. Chủ đề: {exam_topic}
+                2. Tạo 2 phần: ĐỀ THI và ĐÁP ÁN CHI TIẾT.
+                3. Nội dung phù hợp học sinh tiểu học.
+                4. Trình bày rõ ràng.
+                """
+                
+                # 3. Gọi hàm xử lý thông minh
+                result_text, used_model = generate_content_with_rotation(api_key, prompt)
+                
+                if used_model:
+                    st.session_state['result'] = result_text
+                    st.success(f"✅ Đã tạo xong! (Sử dụng model: {used_model})")
+                else:
+                    st.error(f"❌ Thất bại: {result_text}")
+
+with col2:
+    st.subheader("2. Kết quả & Tải về")
+    
+    if 'result' in st.session_state:
+        # Khu vực chỉnh sửa
+        edited_content = st.text_area(
+            "Nội dung đề thi (Sửa trực tiếp tại đây):",
+            value=st.session_state['result'],
+            height=600
+        )
+        
+        # Nút tải về
+        docx_file = create_docx(edited_content, exam_topic if exam_topic else "De_thi")
+        st.download_button(
+            label="📥 Tải xuống file Word (.docx)",
+            data=docx_file.getvalue(),
+            file_name=f"De_thi_{exam_topic.replace(' ', '_')}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary"
+        )
+    else:
+        st.info("👈 Hãy upload file ma trận và bấm nút tạo đề.")
