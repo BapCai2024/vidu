@@ -5,265 +5,236 @@ from io import BytesIO
 import docx
 from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 import time
 import json
 import re
 from pypdf import PdfReader
 
 # --- CẤU HÌNH TRANG ---
-st.set_page_config(page_title="Ra Đề Thi Chuẩn CT2018 (Final)", layout="wide", page_icon="📚")
-st.title("📚 Hệ Thống Ra Đề Thi Tiểu Học (Chuẩn CT GDPT 2018)")
-st.caption("✅ Nguồn dữ liệu: Kết nối tri thức / Chân trời sáng tạo / Cánh diều. ✅ Đúng thứ tự ma trận.")
+st.set_page_config(page_title="Hệ Thống Ra Đề Thi V6", layout="wide", page_icon="📝")
+st.title("📝 Hệ Thống Ra Đề Thi Tiểu Học (Chuẩn Form Nhà Trường)")
+st.caption("✅ Sách: Kết nối / Chân trời / Cánh diều / Cùng khám phá. ✅ Header chuẩn. ✅ Format câu hỏi chi tiết.")
 st.markdown("---")
 
 # ==============================================================================
-# 1. API ENGINE (ROBUST MODE)
+# 1. API ENGINE
 # ==============================================================================
 def generate_content_strict(api_key, prompt, response_json=False):
-    """
-    Hàm gọi AI với chế độ 'Khắt khe'.
-    Tự động retry nếu lỗi.
-    """
     genai.configure(api_key=api_key)
-    try:
-        all_models = list(genai.list_models())
-    except: return None, "Lỗi kết nối API. Vui lòng kiểm tra Key/Mạng."
-
-    # Lọc model
+    try: all_models = list(genai.list_models())
+    except: return None, "Lỗi kết nối API."
+    
     valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
-    if not valid_models: return None, "Không tìm thấy model nào hỗ trợ."
-
-    # Ưu tiên model thông minh nhất (Pro) để đảm bảo kiến thức CT2018 chính xác
-    priority = []
-    if response_json:
-        # JSON cần nhanh và tuân thủ format -> Flash
-        priority = [m for m in valid_models if 'flash' in m] + valid_models
-    else:
-        # Nội dung đề cần chính xác sách giáo khoa -> Pro
-        priority = [m for m in valid_models if 'pro' in m] + valid_models
-
-    last_err = ""
-    for attempt in range(3):
-        for m in priority:
-            try:
-                # Cấu hình safety settings để không bị block nhầm
-                model = genai.GenerativeModel(m, generation_config={"response_mime_type": "application/json"} if response_json else {})
-                res = model.generate_content(prompt)
-                return res.text, m
-            except Exception as e:
-                last_err = str(e)
-                if "429" in last_err: time.sleep(2); continue
-                continue
-    return None, f"Lỗi khởi tạo nội dung: {last_err}"
+    if not valid_models: return None, "Không tìm thấy model hỗ trợ."
+    
+    # Ưu tiên Flash cho JSON (nhanh), Pro cho viết đề (thông minh)
+    priority = [m for m in valid_models if 'flash' in m] if response_json else [m for m in valid_models if 'pro' in m]
+    priority += valid_models # Thêm các model còn lại
+    
+    for m in priority:
+        try:
+            model = genai.GenerativeModel(m, generation_config={"response_mime_type": "application/json"} if response_json else {})
+            res = model.generate_content(prompt)
+            return res.text, m
+        except: time.sleep(1); continue
+    return None, "Server quá tải (429). Vui lòng thử lại sau 30s."
 
 # ==============================================================================
-# 2. XỬ LÝ FILE (PRE-PROCESSING)
+# 2. XỬ LÝ FILE
 # ==============================================================================
-def process_file(uploaded_file):
+def process_file(file):
     try:
-        if uploaded_file.name.endswith('.xlsx'):
-            df = pd.read_excel(uploaded_file, header=None)
-            # Tìm header chứa "Chủ đề" hoặc "Mạch"
+        if file.name.endswith('.xlsx'):
+            df = pd.read_excel(file, header=None)
             h_idx = 0
-            for i, row in df.iterrows():
-                if any(k in str(s).lower() for k in ['chủ đề', 'mạch kiến thức', 'nội dung']):
-                    h_idx = i; break
-            df = df.iloc[h_idx:].reset_index(drop=True)
-            df = df.ffill() # Lấp đầy ô merge
-            return df.to_string()
-            
-        elif uploaded_file.name.endswith('.pdf'):
-            reader = PdfReader(uploaded_file); txt = ""
-            for p in reader.pages: txt += p.extract_text() + "\n"
-            return txt
-            
-        elif uploaded_file.name.endswith('.docx'):
-            doc = docx.Document(uploaded_file); txt = ""
+            for i, r in df.iterrows():
+                if any(k in str(s).lower() for k in ['chủ đề', 'mạch']): h_idx = i; break
+            return df.iloc[h_idx:].ffill().to_string()
+        elif file.name.endswith('.pdf'):
+            return "".join([p.extract_text() for p in PdfReader(file).pages])
+        elif file.name.endswith('.docx'):
+            doc = docx.Document(file); txt = ""
             for t in doc.tables:
                 for r in t.rows: txt += " | ".join([c.text.strip() for c in r.cells]) + "\n"
             return txt
-    except Exception as e: return f"Lỗi đọc file: {e}"
-    return ""
+    except: return ""
 
 # ==============================================================================
-# 3. LOGIC AI (CT2018 STRICT MODE)
+# 3. LOGIC AI (PROMPT ĐƯỢC TINH CHỈNH KHẮT KHE)
 # ==============================================================================
 
-def step1_analyze_matrix(file_text, api_key):
-    """
-    Bước 1: Trích xuất danh sách yêu cầu (Blueprint).
-    Yêu cầu: Giữ nguyên thứ tự dòng.
-    """
+def step1_analyze(txt, api_key):
     prompt = f"""
-    Bạn là trợ lý giáo dục. Nhiệm vụ: Phân tích văn bản ma trận đề thi dưới đây thành JSON.
-    
-    YÊU CẦU QUAN TRỌNG:
-    1. Giữ nguyên thứ tự xuất hiện của các câu hỏi (Dòng nào trước ghi trước).
-    2. Chỉ trích xuất những dòng có yêu cầu ra câu hỏi (Số lượng > 0).
-
-    VĂN BẢN MA TRẬN:
-    {file_text[:25000]}
-
-    OUTPUT JSON FORMAT (List of Objects):
+    Phân tích ma trận sau thành JSON (Giữ nguyên thứ tự dòng):
+    {txt[:25000]}
+    OUTPUT JSON:
     [
       {{
         "order": 1,
-        "topic": "Tên bài/Chủ đề (VD: Bài 3 - Vật dẫn nhiệt...)",
-        "yccd": "Yêu cầu cần đạt (VD: Nêu được ứng dụng...)",
+        "topic": "...", 
+        "yccd": "...",
         "type": "TN 4 lựa chọn / Đúng Sai / Nối cột / Điền khuyết / Tự luận",
-        "level": "Mức 1 (Biết) / Mức 2 (Hiểu) / Mức 3 (Vận dụng)",
-        "label": "Câu 1" (Nếu file có ghi rõ số câu, nếu không để trống)
+        "level": "Mức 1 / Mức 2 / Mức 3",
+        "points": "0.5" (Nếu có),
+        "label": "Câu 1" (Nếu có)
       }}
     ]
+    Chỉ lấy dòng có yêu cầu ra câu hỏi.
     """
-    res, model = generate_content_strict(api_key, prompt, response_json=True)
-    return res, model
+    return generate_content_strict(api_key, prompt, response_json=True)
 
-def step2_create_exam(blueprint_json, subject_grade, api_key):
-    """
-    Bước 2: Viết đề thi dựa trên Blueprint.
-    Yêu cầu: Kiến thức 3 bộ sách, Format chuẩn.
-    """
+def step2_create(json_data, subject, school_name, exam_name, time_limit, api_key):
     prompt = f"""
-    Đóng vai: Chuyên gia biên soạn đề thi Tiểu học theo Chương trình GDPT 2018.
-    Nhiệm vụ: Soạn đề thi môn {subject_grade} dựa trên cấu trúc JSON sau.
+    Bạn là chuyên gia ra đề thi Tiểu học. Hãy soạn nội dung đề thi môn {subject} dựa trên JSON sau:
+    {json_data}
 
-    DỮ LIỆU CẤU TRÚC (BẮT BUỘC TUÂN THỦ THỨ TỰ):
-    {blueprint_json}
+    1. NGUỒN DỮ LIỆU: 
+       - Sách: Kết nối tri thức, Chân trời sáng tạo, Cánh diều, Cùng khám phá (Tin học).
+       - Nội dung phải chính xác, khoa học.
 
-    NGUỒN DỮ LIỆU (TỐI QUAN TRỌNG):
-    Chỉ sử dụng kiến thức, ngữ liệu, thuật ngữ nằm trong 3 bộ sách giáo khoa hiện hành:
-    1. Kết nối tri thức với cuộc sống
-    2. Chân trời sáng tạo
-    3. Cánh diều
-    (Tuyệt đối không sử dụng kiến thức cũ trước 2018 hoặc kiến thức trên mạng không chính thống).
-
-    QUY ĐỊNH VỀ DẠNG CÂU HỎI (FORMAT):
-    1. "TN 4 lựa chọn": Câu hỏi + 4 đáp án A, B, C, D.
-    2. "Đúng/Sai": 
-       - Định dạng:
-         Câu X: [Đề dẫn]
-         a) [Ý 1] ( )
-         b) [Ý 2] ( )
-         c) [Ý 3] ( )
-         d) [Ý 4] ( )
-    3. "Nối cột": Tạo 2 cột nội dung tương ứng để học sinh nối.
-    4. "Điền khuyết": Một đoạn văn có chỗ trống (.....).
-
-    YÊU CẦU TRÌNH BÀY:
-    - Đánh số câu liên tục theo danh sách JSON (Câu 1, Câu 2...).
-    - KHÔNG tự ý đảo lộn thứ tự, KHÔNG tự ý gom nhóm (trừ khi ma trận yêu cầu).
-    - Cuối cùng là phần: ĐÁP ÁN VÀ HƯỚNG DẪN CHẤM (Chi tiết).
+    2. FORMAT CÂU HỎI (BẮT BUỘC):
+       - Cấu trúc tiêu đề câu: **Câu [X]:** ([Điểm] điểm) [Mức độ] [Nội dung câu hỏi]
+       - Ví dụ: **Câu 1:** (0,5 điểm) [Mức 1] Thiết bị nào sau đây...
+       
+       - Dạng "TN 4 lựa chọn": 4 đáp án A. B. C. D. xuống dòng.
+       - Dạng "Đúng/Sai": Tạo các ý a, b, c, d.
+       - Dạng "Điền khuyết": Dùng dấu chấm "......" (ít nhất 6 chấm).
+       - Dạng "Nối cột": 
+         + Thiết kế nội dung để hiển thị thành 2 cột.
+         + Cột A (1,2,3,4) - Cột B (a,b,c,d).
+    
+    3. YÊU CẦU KHÁC:
+       - Logic câu hỏi: Phải chặt chẽ, không đánh đố sai mức độ.
+       - KHÔNG viết lời chào, KHÔNG viết tiêu đề (Tiêu đề sẽ do code tự sinh).
+       - Bắt đầu ngay vào Câu 1.
+       - Cuối cùng là phần ĐÁP ÁN CHI TIẾT.
     """
-    res, model = generate_content_strict(api_key, prompt, response_json=False)
-    return res, model
+    return generate_content_strict(api_key, prompt, response_json=False)
 
 # ==============================================================================
-# 4. XUẤT WORD
+# 4. XUẤT WORD (HEADER CHUẨN + FORMAT ĐẸP)
 # ==============================================================================
-def create_docx_final(text):
+def set_cell_border(cell, **kwargs):
+    """Hàm hỗ trợ kẻ khung cho bảng (dùng cho câu nối cột nếu cần)"""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    for border_name in kwargs:
+        xml = f'<w:{border_name} w:val="single" w:sz="4" w:space="0" w:color="auto" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+        tcPr.append(OxmlElement(xml))
+
+def create_docx_final(text, school_name, exam_name, subject, time_limit):
     doc = docx.Document()
     style = doc.styles['Normal']; font = style.font
     font.name = 'Times New Roman'; font.size = Pt(13)
     
-    # Căn lề
-    for s in doc.sections:
-        s.top_margin = Cm(2); s.bottom_margin = Cm(2)
-        s.left_margin = Cm(2.5); s.right_margin = Cm(2)
+    # 1. TẠO HEADER (QUỐC HIỆU + TÊN TRƯỜNG)
+    table = doc.add_table(rows=1, cols=2)
+    table.autofit = False
+    table.columns[0].width = Cm(7)  # Cột trái
+    table.columns[1].width = Cm(9)  # Cột phải
+    
+    # Ô trái: Trường
+    cell_left = table.cell(0, 0)
+    p_left = cell_left.paragraphs[0]
+    p_left.add_run(f"{school_name.upper()}\n").bold = True
+    p_left.add_run("ĐỀ KIỂM TRA ĐỊNH KỲ").bold = False
+    p_left.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Ô phải: Quốc hiệu (Có thể bỏ nếu chỉ cần tên kì thi)
+    cell_right = table.cell(0, 1)
+    p_right = cell_right.paragraphs[0]
+    p_right.add_run(f"{exam_name.upper()}\n").bold = True
+    p_right.add_run(f"Môn: {subject}\n").bold = True
+    p_right.add_run(f"Thời gian: {time_limit} phút").italic = True
+    p_right.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    doc.add_paragraph("\n") # Khoảng cách
 
+    # 2. XỬ LÝ NỘI DUNG CHÍNH
     lines = text.split('\n')
     for line in lines:
         clean = line.strip()
         if not clean: continue
         
-        p = doc.add_paragraph(clean)
-        
-        # In đậm tiêu đề câu (Câu 1:, Câu 2...)
-        if re.match(r'^(Câu|Bài)\s+\d+[:.]', clean):
-            p.runs[0].bold = True
-            p.runs[0].font.color.rgb = RGBColor(0, 0, 0)
-        
-        # In đậm các phần lớn
-        elif any(x in clean.lower() for x in ["phần", "đáp án", "hướng dẫn", "đề thi"]):
+        # Xử lý tiêu đề phần Đáp án
+        if "ĐÁP ÁN" in clean.upper() or "HƯỚNG DẪN CHẤM" in clean.upper():
+            doc.add_page_break() # Sang trang mới chấm cho dễ
+            p = doc.add_paragraph(clean)
             p.runs[0].bold = True
             p.runs[0].font.size = Pt(14)
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            
-        # Thụt lề cho các ý a), b) của câu đúng sai
-        if re.match(r'^[a-d]\)', clean):
-            p.paragraph_format.left_indent = Cm(1)
+            continue
+
+        p = doc.add_paragraph(clean)
+        
+        # In đậm "Câu X:" và "[Mức độ]"
+        # Regex tìm: Câu 1: (0.5 điểm) [Mức 1]
+        if re.match(r'^Câu\s+\d+:', clean):
+            p.runs[0].bold = True
+            p.runs[0].font.color.rgb = RGBColor(0, 0, 0)
+        
+        # Format đặc biệt cho câu Nối cột (Nếu AI tạo dạng Cột A | Cột B)
+        if "Cột A" in clean and "Cột B" in clean:
+            p.runs[0].bold = True
+            # (Có thể nâng cấp thêm code tạo bảng thực sự ở đây nếu cần thiết)
 
     bio = BytesIO(); doc.save(bio); return bio
 
 # ==============================================================================
-# 5. UI (STREAMLIT)
+# 5. UI (TỐI GIẢN HÓA)
 # ==============================================================================
 with st.sidebar:
-    st.header("🔑 Cấu hình"); api_key = st.text_input("Gemini API Key", type="password")
+    st.header("Cấu hình"); api_key = st.text_input("API Key", type="password")
 
 col1, col2 = st.columns([1, 1.5])
 
 with col1:
-    st.subheader("1. Nhập liệu")
-    uploaded_file = st.file_uploader("Tải lên Ma trận (Excel/PDF/Word)", type=['xlsx', 'pdf', 'docx'])
-    subject = st.text_input("Tên môn & Lớp (VD: Khoa học lớp 4 - Bộ sách Kết nối)")
+    st.subheader("1. Thông tin Đề thi")
+    uploaded_file = st.file_uploader("Upload Ma Trận", type=['xlsx', 'docx', 'pdf'])
     
-    if st.button("🚀 TẠO ĐỀ THI (Chuẩn CT2018)", type="primary"):
-        if not uploaded_file or not api_key:
-            st.warning("Thiếu thông tin!")
-        else:
-            status = st.status("Đang khởi chạy quy trình...", expanded=True)
-            
-            try:
-                # B1: Đọc file
-                status.write("📂 Đang đọc nội dung file...")
-                txt = process_file(uploaded_file)
-                
-                # B2: Phân tích cấu trúc
-                status.write("🤖 Đang trích xuất ma trận (Giữ nguyên thứ tự)...")
-                bp, m1 = step1_analyze_matrix(txt, api_key)
-                
-                if bp:
-                    st.session_state['blueprint'] = bp
-                    status.write(f"✅ Đã hiểu cấu trúc (Model: {m1})")
-                    
-                    # B3: Viết đề
-                    status.write("✍️ Đang soạn câu hỏi từ sách giáo khoa (CT2018)...")
-                    exam, m2 = step2_create_exam(bp, subject, api_key)
-                    
-                    if exam:
-                        st.session_state['result'] = exam
-                        status.update(label="Hoàn tất! Kết quả hiển thị bên phải.", state="complete", expanded=False)
-                    else:
-                        status.update(label="Lỗi tạo đề", state="error"); st.error(m2)
-                else:
-                    status.update(label="Lỗi phân tích ma trận", state="error"); st.error(m1)
-            except Exception as e:
-                status.update(label="Lỗi hệ thống", state="error"); st.error(e)
+    with st.expander("Thông tin chi tiết (Bắt buộc)", expanded=True):
+        school_name = st.text_input("Tên trường", value="TRƯỜNG TH KIM ĐỒNG")
+        exam_name = st.text_input("Tên kì thi", value="CUỐI HỌC KÌ 1 NĂM HỌC 2024-2025")
+        subject = st.text_input("Môn học & Lớp", value="Tin học lớp 3")
+        time_limit = st.number_input("Thời gian (phút)", value=35)
+    
+    if st.button("🚀 TẠO ĐỀ THI NGAY", type="primary"):
+        if uploaded_file and api_key:
+            # CHỈ HIỆN 1 DÒNG TRẠNG THÁI DUY NHẤT
+            with st.spinner("🤖 AI đang phân tích ma trận và soạn đề... (Vui lòng đợi khoảng 30s)"):
+                try:
+                    # B1: Đọc
+                    txt = process_file(uploaded_file)
+                    # B2: Phân tích
+                    bp, m1 = step1_analyze(txt, api_key)
+                    if bp:
+                        # B3: Viết đề
+                        exam, m2 = step2_create(bp, subject, school_name, exam_name, time_limit, api_key)
+                        if exam:
+                            st.session_state['result'] = exam
+                            st.session_state['meta'] = {'school': school_name, 'exam': exam_name, 'sub': subject, 'time': time_limit}
+                            st.success("✅ Đã xong! Xem kết quả bên phải.")
+                        else: st.error(f"Lỗi tạo đề: {m2}")
+                    else: st.error(f"Lỗi phân tích: {m1}")
+                except Exception as e: st.error(f"Lỗi: {e}")
+        else: st.warning("Vui lòng nhập Key và upload file.")
 
 with col2:
-    st.subheader("2. Kết quả")
-    tab1, tab2 = st.tabs(["📝 Đề thi", "🔍 Dữ liệu phân tích"])
-    
-    with tab2:
-        if 'blueprint' in st.session_state:
-            try: st.json(json.loads(st.session_state['blueprint'].replace("```json","").replace("```","")))
-            except: st.text(st.session_state['blueprint'])
-            
-    with tab1:
-        if 'result' in st.session_state:
-            # Hiển thị kết quả ra Text Area để người dùng thấy ngay
-            res_content = st.session_state['result']
-            edited_txt = st.text_area("Xem trước & Chỉnh sửa:", value=res_content, height=700)
-            
-            # Tạo nút tải về
-            doc = create_docx_final(edited_txt)
-            st.download_button(
-                label="📥 Tải file Word (.docx)",
-                data=doc,
-                file_name=f"De_{subject.replace(' ','_')}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary"
-            )
-        else:
-            st.info("Chưa có kết quả. Vui lòng nhấn nút Tạo đề bên trái.")
+    st.subheader("2. Xem trước & Tải về")
+    if 'result' in st.session_state:
+        # Hiển thị
+        res_txt = st.text_area("", st.session_state['result'], height=700)
+        
+        # Tạo file
+        meta = st.session_state['meta']
+        doc = create_docx_final(res_txt, meta['school'], meta['exam'], meta['sub'], meta['time'])
+        
+        st.download_button(
+            "📥 Tải file Word chuẩn (.docx)", 
+            doc, 
+            f"De_{meta['sub'].replace(' ','_')}.docx", 
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document", 
+            type="primary"
+        )
