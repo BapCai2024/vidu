@@ -8,14 +8,14 @@ import google.generativeai as genai
 # Cấu hình trang
 st.set_page_config(page_title="Gemini Exam Generator", layout="wide")
 
-st.title("🎓 Tool Hỗ Trợ Ra Đề Thi Tiểu Học (Powered by Gemini)")
+st.title("🎓 Tool Hỗ Trợ Ra Đề Thi Tiểu Học (Gemini)")
 st.markdown("---")
 
 # Sidebar: Nhập API Key
 with st.sidebar:
     st.header("Cấu hình")
     api_key = st.text_input("Nhập Google Gemini API Key", type="password")
-    st.info("Bạn có thể lấy key miễn phí tại: aistudio.google.com")
+    st.info("Lấy key miễn phí tại: aistudio.google.com")
 
 # Hàm đọc nội dung từ file
 def read_file(uploaded_file):
@@ -44,8 +44,9 @@ def generate_exam(matrix_text, topic):
     # Cấu hình Gemini
     try:
         genai.configure(api_key=api_key)
-        # Sử dụng model flash cho tốc độ nhanh, hoặc gemini-1.5-pro để thông minh hơn
-        model = genai.GenerativeModel('gemini-1.5-flash') 
+        
+        # --- SỬA LỖI TẠI ĐÂY: Dùng model 'gemini-pro' thay vì 'gemini-1.5-flash' ---
+        model = genai.GenerativeModel('gemini-pro') 
         
         # Prompt (Câu lệnh)
         prompt = f"""
@@ -78,9 +79,13 @@ def create_docx(exam_text):
     doc = docx.Document()
     doc.add_heading('ĐỀ THI TIỂU HỌC', 0)
     
-    # Xử lý text để đưa vào word đỡ bị lỗi format dòng
-    for line in exam_text.split('\n'):
-        doc.add_paragraph(line)
+    # Xử lý text để đưa vào word
+    # Thay thế các ký tự markdown cơ bản để word đỡ lỗi
+    clean_text = exam_text.replace("**", "").replace("##", "")
+    
+    for line in clean_text.split('\n'):
+        if line.strip():
+            doc.add_paragraph(line)
     
     bio = BytesIO()
     doc.save(bio)
@@ -132,7 +137,7 @@ with tab1:
             st.download_button(
                 label="📥 Tải xuống file Word (.docx)",
                 data=docx_file.getvalue(),
-                file_name=f"De_thi_{exam_topic}.docx".replace(" ", "_"),
+                file_name=f"De_thi_Gemini.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
         else:
