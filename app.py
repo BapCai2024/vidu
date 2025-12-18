@@ -11,343 +11,218 @@ import re
 from pypdf import PdfReader
 
 # --- CẤU HÌNH TRANG ---
-st.set_page_config(
-    page_title="AI Exam Generator Pro (CT GDPT 2018)",
-    layout="wide",
-    page_icon="🏫"
-)
-
-st.title("🏫 Hệ Thống Ra Đề Thi Tiểu Học (Chuẩn CT GDPT 2018)")
-st.caption("Hỗ trợ: Excel, PDF, Word. Tự động xử lý dạng câu hỏi: Đúng/Sai, Nối cột, Trắc nghiệm.")
+st.set_page_config(page_title="Tool Ra Đề Thi (Chuẩn Ma Trận)", layout="wide", page_icon="🏫")
+st.title("🏫 Hệ Thống Ra Đề Thi (Bám Sát Thứ Tự Ma Trận)")
+st.caption("Fix lỗi: Giữ nguyên thứ tự câu hỏi trong ma trận - Không tự ý gom nhóm.")
 st.markdown("---")
 
 # ==============================================================================
-# PHẦN 1: XỬ LÝ API & MODEL (CORE 7H.PY UPDATE)
+# 1. API & MODEL (GIỮ NGUYÊN TỐI ƯU CŨ)
 # ==============================================================================
-
-def get_best_model(api_key, response_json=False):
-    """
-    Tự động tìm model tốt nhất trong tài khoản.
-    - Phân tích ma trận (JSON) -> Ưu tiên Flash (nhanh, context dài).
-    - Viết đề (Text) -> Ưu tiên Pro (thông minh, văn hay).
-    """
+def generate_content_robust(api_key, prompt, response_json=False):
     genai.configure(api_key=api_key)
     try:
         all_models = list(genai.list_models())
-    except Exception as e:
-        return None, f"Lỗi kết nối API: {str(e)}"
-
-    valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
-    if not valid_models:
-        return None, "Không tìm thấy model nào hỗ trợ generateContent."
-
-    # Chiến thuật chọn model
-    priority = []
-    if response_json:
-        # Ưu tiên Flash cho JSON
-        priority = [m for m in valid_models if 'flash' in m and '1.5' in m] + \
-                   [m for m in valid_models if 'pro' in m and '1.5' in m]
-    else:
-        # Ưu tiên Pro cho Viết đề
-        priority = [m for m in valid_models if 'pro' in m and '1.5' in m] + \
-                   [m for m in valid_models if 'flash' in m and '1.5' in m]
+    except: return None, "Lỗi kết nối API."
     
-    # Thêm các model còn lại (dự phòng)
-    for m in valid_models:
-        if m not in priority: priority.append(m)
-        
-    return priority, None
-
-def generate_content_robust(api_key, prompt, response_json=False):
-    """Hàm gọi API có cơ chế Retry (Thử lại) khi lỗi 429"""
-    models, error = get_best_model(api_key, response_json)
-    if error: return None, error
-
-    last_error = ""
-    config = {"response_mime_type": "application/json"} if response_json else {}
-
-    # Thử tối đa 3 lần xoay vòng
+    # Ưu tiên Flash cho xử lý JSON (Nhanh), Pro cho viết đề (Thông minh)
+    valid_models = [m.name for m in all_models if 'generateContent' in m.supported_generation_methods]
+    if not valid_models: return None, "Không có model phù hợp."
+    
+    priority = []
+    if response_json: priority = [m for m in valid_models if 'flash' in m] + valid_models
+    else: priority = [m for m in valid_models if 'pro' in m] + valid_models # Ưu tiên Pro để viết đề khôn hơn
+    
     for attempt in range(3):
-        for model_name in models:
+        for m in priority:
             try:
-                model = genai.GenerativeModel(model_name, generation_config=config)
-                response = model.generate_content(prompt)
-                return response.text, model_name
+                model = genai.GenerativeModel(m, generation_config={"response_mime_type": "application/json"} if response_json else {})
+                res = model.generate_content(prompt)
+                return res.text, m
             except Exception as e:
-                err_str = str(e)
-                last_error = err_str
-                # Nếu lỗi Quá tải (429) hoặc Model quá tải (503)
-                if "429" in err_str or "ResourceExhausted" in err_str or "503" in err_str:
-                    time.sleep(2) # Nghỉ 2s rồi thử model khác
-                    continue
-                continue 
-
-    return None, f"Thất bại sau nhiều lần thử. Lỗi cuối: {last_error}"
+                if "429" in str(e): time.sleep(2); continue
+                continue
+    return None, "Lỗi API (Quá tải/Sai Key)"
 
 # ==============================================================================
-# PHẦN 2: BỘ ĐỌC FILE ĐA NĂNG (PRE-PROCESSORS)
+# 2. XỬ LÝ FILE (GIỮ NGUYÊN)
 # ==============================================================================
-
 def process_excel_to_text(file):
     try:
-        # Đọc không header để bắt trọn dữ liệu
         df = pd.read_excel(file, header=None)
-        
-        # Tìm dòng Header chính
-        header_idx = 0
-        for idx, row in df.iterrows():
-            row_str = row.astype(str).str.lower().values
-            if any('chủ đề' in s or 'mạch' in s for s in row_str):
-                header_idx = idx
-                break
-        
-        df_clean = df.iloc[header_idx:].reset_index(drop=True)
-        
-        # QUAN TRỌNG: Forward Fill để xử lý Merge Cell (File Book1.xlsx của bạn bị lỗi này)
-        # Các ô chủ đề bị gộp sẽ được điền tên xuống các dòng dưới
-        df_clean = df_clean.ffill()
-        
-        return df_clean.to_string()
-    except Exception as e:
-        return f"Lỗi đọc Excel: {e}"
+        # Tìm header
+        h_idx = 0
+        for i, row in df.iterrows():
+            if any('chủ đề' in str(s).lower() or 'mạch' in str(s).lower() for s in row): h_idx = i; break
+        df = df.iloc[h_idx:].reset_index(drop=True)
+        df = df.ffill() # Quan trọng: Lấp đầy ô merge
+        return df.to_string()
+    except: return "Lỗi Excel"
 
 def process_pdf_to_text(file):
     try:
-        reader = PdfReader(file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-        return text
-    except Exception as e:
-        return f"Lỗi đọc PDF: {e}"
+        reader = PdfReader(file); txt = ""
+        for p in reader.pages: txt += p.extract_text() + "\n"
+        return txt
+    except: return "Lỗi PDF"
 
 def process_docx_to_text(file):
     try:
-        doc = docx.Document(file)
-        text = ""
-        for table in doc.tables:
-            for row in table.rows:
-                # Dùng dấu | để ngăn cách các cột cho AI dễ hiểu
-                text += " | ".join([cell.text.strip() for cell in row.cells]) + "\n"
-        return text
-    except Exception as e:
-        return f"Lỗi đọc Word: {e}"
+        doc = docx.Document(file); txt = ""
+        for t in doc.tables:
+            for r in t.rows: txt += " | ".join([c.text.strip() for c in r.cells]) + "\n"
+        return txt
+    except: return "Lỗi Word"
 
 # ==============================================================================
-# PHẦN 3: LOGIC AI (PHÂN TÍCH & TẠO ĐỀ)
+# 3. LOGIC AI MỚI (QUAN TRỌNG NHẤT)
 # ==============================================================================
 
 def analyze_matrix_step(file_text, api_key):
-    """Bước 1: Chuyển văn bản thô thành cấu trúc JSON"""
+    """
+    Bước 1: Trích xuất danh sách câu hỏi theo đúng thứ tự xuất hiện trong file.
+    """
     prompt = f"""
-    Bạn là trợ lý xử lý dữ liệu giáo dục. Hãy phân tích văn bản ma trận đề thi dưới đây thành JSON.
+    Phân tích ma trận đề thi sau thành JSON List.
+    QUAN TRỌNG: Giữ nguyên thứ tự xuất hiện của các câu hỏi trong văn bản gốc. Không được tự ý sắp xếp lại.
     
-    VĂN BẢN ĐẦU VÀO:
-    {file_text[:20000]} 
+    VĂN BẢN MA TRẬN:
+    {file_text[:20000]}
 
-    YÊU CẦU OUTPUT (JSON List):
-    Hãy trích xuất danh sách các yêu cầu ra đề. Chỉ lấy những dòng có số lượng câu hỏi > 0.
-    Cấu trúc mẫu:
+    OUTPUT JSON FORMAT:
     [
       {{
-        "topic": "Tên chủ đề / Mạch kiến thức",
-        "yccd": "Yêu cầu cần đạt (nếu có)",
-        "questions": [
-           {{"type": "TN nhiều lựa chọn", "level": "Biết", "count": "1 câu"}},
-           {{"type": "TN Đúng/Sai", "level": "Hiểu", "count": "1 câu"}},
-           {{"type": "Tự luận", "level": "Vận dụng", "count": "1 câu"}}
-        ]
+        "order": 1, // Số thứ tự dòng trong ma trận
+        "topic": "Chủ đề...",
+        "yccd": "Yêu cầu cần đạt...",
+        "question_type": "TN 4 lựa chọn / Đúng Sai / Nối cột / Điền khuyết / Tự luận",
+        "level": "Biết/Hiểu/Vận dụng",
+        "question_label": "Câu 1" // Nếu trong file có ghi rõ là Câu 1, Câu 2...
       }}
     ]
-    Lưu ý:
-    - Nếu gặp "Đúng - Sai" hãy ghi type là "TN Đúng/Sai".
-    - Nếu gặp "Nối cột" hãy ghi type là "TN Nối cột".
+    Chỉ trích xuất những dòng CÓ YÊU CẦU RA CÂU HỎI.
     """
     res, model = generate_content_robust(api_key, prompt, response_json=True)
     return res, model
 
 def create_exam_step(blueprint_json, subject, api_key):
-    """Bước 2: Viết đề thi (Strict Mode - Ép đúng dạng bài)"""
+    """
+    Bước 2: Viết đề thi - TUÂN THỦ TUYỆT ĐỐI THỨ TỰ TRONG JSON
+    """
     prompt = f"""
-    Bạn là giáo viên tiểu học (CT GDPT 2018). Hãy soạn đề thi môn {subject} dựa trên cấu trúc JSON sau:
+    Bạn là chuyên gia ra đề thi Tiểu học (CT GDPT 2018).
+    Nhiệm vụ: Soạn câu hỏi lần lượt theo danh sách JSON dưới đây.
+    
+    DỮ LIỆU ĐẦU VÀO (Đã sắp xếp đúng thứ tự ma trận):
     {blueprint_json}
 
-    QUY TẮC BẮT BUỘC VỀ DẠNG CÂU HỎI (STRICT MODE):
-    1. Dạng "TN nhiều lựa chọn":
-       - Hỏi 1 câu, có 4 đáp án A, B, C, D.
+    QUY TẮC VÀNG (BẮT BUỘC TUÂN THỦ):
+    1. **KHÔNG ĐƯỢC ĐẢO LỘN THỨ TỰ**: Phần tử đầu tiên trong JSON phải là Câu 1, phần tử thứ 2 là Câu 2. Tuyệt đối không gom nhóm Trắc nghiệm riêng, Tự luận riêng nếu ma trận không yêu cầu.
+    2. **ĐÁNH SỐ CÂU**: Nếu JSON có trường "question_label" (VD: Câu 5) thì dùng đúng số đó. Nếu không, hãy đánh số liên tục 1, 2, 3...
     
-    2. Dạng "TN Đúng/Sai" (Bắt buộc làm đúng format này):
-       - Đưa ra 1 câu dẫn chính.
-       - Bên dưới là 4 ý a), b), c), d).
-       - Học sinh sẽ xác định mỗi ý là Đúng hay Sai.
-       - Ví dụ:
-         Câu 1: Phát biểu nào sau đây về...
-         a) ... (Đ/S?)
-         b) ... (Đ/S?)
-    
-    3. Dạng "TN Nối cột" (Matching):
-       - Tạo Cột A (1, 2, 3, 4) và Cột B (a, b, c, d).
-       - Yêu cầu nối thông tin tương ứng.
+    QUY ĐỊNH DẠNG CÂU HỎI (FORMAT):
+    - **TN 4 lựa chọn**: 1 câu hỏi + 4 đáp án A. B. C. D.
+    - **Đúng/Sai**: 
+        Câu X: ...
+        a) ... ( )
+        b) ... ( )
+        c) ... ( )
+        d) ... ( )
+    - **Nối cột**:
+        Câu X: Nối cột A với cột B
+        Cột A: 1. ..., 2. ...
+        Cột B: a. ..., b. ...
+    - **Tự luận**: Câu hỏi mở + Hướng dẫn trả lời.
 
-    4. Dạng "Tự luận":
-       - Câu hỏi mở, ngắn gọn, sát thực tế.
-
-    CẤU TRÚC ĐỀ THI:
-    - PHẦN I: TRẮC NGHIỆM (Bao gồm nhiều lựa chọn, đúng/sai, nối cột).
-    - PHẦN II: TỰ LUẬN.
-    - PHẦN III: ĐÁP ÁN VÀ HƯỚNG DẪN CHẤM (Chi tiết thang điểm).
-
-    TRÌNH BÀY:
-    - Đánh số câu liên tục (Câu 1, Câu 2...).
-    - Ngôn ngữ trong sáng, dễ hiểu.
+    OUTPUT TRÌNH BÀY:
+    - Bắt đầu ngay vào câu hỏi (Không cần chia Phần I, Phần II nếu làm xáo trộn thứ tự).
+    - Cuối cùng là phần ĐÁP ÁN CHI TIẾT.
     """
     res, model = generate_content_robust(api_key, prompt, response_json=False)
     return res, model
 
 # ==============================================================================
-# PHẦN 4: XUẤT FILE WORD ĐẸP
+# 4. XUẤT WORD (UPDATE FORMAT)
 # ==============================================================================
-
 def create_word_doc(text):
     doc = docx.Document()
+    style = doc.styles['Normal']; font = style.font
+    font.name = 'Times New Roman'; font.size = Pt(13)
     
-    # Cài đặt Font chữ toàn bài
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Times New Roman'
-    font.size = Pt(13)
-    
-    # Căn lề A4 chuẩn
-    sections = doc.sections
-    for section in sections:
-        section.top_margin = Cm(2)
-        section.bottom_margin = Cm(2)
-        section.left_margin = Cm(2.5)
-        section.right_margin = Cm(2)
+    # Căn lề
+    for s in doc.sections:
+        s.top_margin = Cm(2); s.bottom_margin = Cm(2)
+        s.left_margin = Cm(2.5); s.right_margin = Cm(2)
 
-    lines = text.split('\n')
-    for line in lines:
-        clean_line = line.strip()
-        if not clean_line: continue
+    for line in text.split('\n'):
+        clean = line.strip()
+        if not clean: continue
+        p = doc.add_paragraph(clean)
         
-        p = doc.add_paragraph(clean_line)
-        lower = clean_line.lower()
-        
-        # Logic in đậm thông minh
-        # 1. In đậm Tiêu đề lớn (Phần I, Phần II, Đề thi...)
-        if any(x in lower for x in ["phần i", "phần ii", "phần iii", "đề thi", "đáp án", "hướng dẫn chấm"]):
-            runner = p.runs[0]
-            runner.bold = True
-            runner.font.size = Pt(14)
-            runner.font.color.rgb = RGBColor(0, 0, 0)
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            
-        # 2. In đậm đầu câu hỏi (Câu 1:, Câu 2:...)
-        # Regex check: Bắt đầu bằng "Câu" + số + dấu chấm hoặc hai chấm
-        elif re.match(r'^Câu\s+\d+[:.]', clean_line):
+        # In đậm thông minh
+        lower = clean.lower()
+        if re.match(r'^(Câu|Bài)\s+\d+[:.]', clean) or "đáp án" in lower or "hướng dẫn chấm" in lower:
             p.runs[0].bold = True
-            
-        # 3. In đậm các ý a), b) trong câu Đúng/Sai nếu cần (Tùy chọn)
+            p.runs[0].font.color.rgb = RGBColor(0, 51, 102) # Màu xanh đậm cho tiêu đề câu
         
-    bio = BytesIO()
-    doc.save(bio)
-    return bio
+        # Format cho dạng Đúng/Sai (a, b, c, d)
+        if re.match(r'^[a-d]\)', clean):
+            p.paragraph_format.left_indent = Cm(1) # Thụt lề cho các ý con
+            
+    bio = BytesIO(); doc.save(bio); return bio
 
 # ==============================================================================
-# PHẦN 5: GIAO DIỆN STREAMLIT (UI)
+# 5. GIAO DIỆN
 # ==============================================================================
-
 with st.sidebar:
-    st.header("🔑 Cấu hình")
-    api_key = st.text_input("Nhập Google API Key", type="password")
-    st.info("Hệ thống tự động chọn model tốt nhất (Flash/Pro) để tránh lỗi.")
+    st.header("Cấu hình"); api_key = st.text_input("API Key", type="password")
 
 col1, col2 = st.columns([1, 1.5])
 
 with col1:
-    st.subheader("1. Thiết lập")
-    uploaded_file = st.file_uploader("Upload Ma Trận (Excel, PDF, Word)", type=['xlsx', 'pdf', 'docx'])
-    subject_name = st.text_input("Tên môn & Lớp (VD: Khoa học lớp 4)")
+    st.subheader("1. Nhập liệu")
+    uploaded_file = st.file_uploader("Upload Ma Trận", type=['xlsx', 'pdf', 'docx'])
+    subject = st.text_input("Tên môn (VD: Khoa học 4)")
     
-    # Nút thực hiện 2 bước
-    if st.button("🚀 Phân tích & Tạo đề", type="primary"):
-        if not uploaded_file or not api_key or not subject_name:
-            st.warning("Vui lòng nhập đủ: API Key, File và Tên môn.")
-        else:
+    if st.button("🚀 Tạo đề (Giữ nguyên thứ tự)", type="primary"):
+        if uploaded_file and api_key:
             status = st.status("Đang xử lý...", expanded=True)
-            try:
-                # --- BƯỚC 1: ĐỌC FILE ---
-                status.write("📂 Đang đọc nội dung file...")
-                file_text = ""
-                if uploaded_file.name.endswith('.xlsx'):
-                    file_text = process_excel_to_text(uploaded_file)
-                elif uploaded_file.name.endswith('.pdf'):
-                    file_text = process_pdf_to_text(uploaded_file)
-                else:
-                    file_text = process_docx_to_text(uploaded_file)
+            
+            # B1: Đọc file
+            status.write("📂 Đọc file...")
+            if uploaded_file.name.endswith('.xlsx'): txt = process_excel_to_text(uploaded_file)
+            elif uploaded_file.name.endswith('.pdf'): txt = process_pdf_to_text(uploaded_file)
+            else: txt = process_docx_to_text(uploaded_file)
+            
+            # B2: Phân tích
+            status.write("🤖 Phân tích thứ tự câu hỏi...")
+            bp, m1 = analyze_matrix_step(txt, api_key)
+            
+            if bp:
+                st.session_state['blueprint'] = bp
+                status.write(f"✅ Đã hiểu cấu trúc (Model: {m1})")
                 
-                # --- BƯỚC 2: PHÂN TÍCH ---
-                status.write("🤖 Đang phân tích ma trận (Trích xuất JSON)...")
-                blueprint, m1 = analyze_matrix_step(file_text, api_key)
+                # B3: Viết đề
+                status.write("✍️ Đang soạn đề theo thứ tự ma trận...")
+                exam, m2 = create_exam_step(bp, subject, api_key)
                 
-                if blueprint:
-                    st.session_state['blueprint'] = blueprint
-                    # Clean json string nếu AI trả về format markdown ```json ... ```
-                    clean_bp = blueprint.replace("```json", "").replace("```", "").strip()
-                    
-                    status.write(f"✅ Phân tích xong (Model: {m1})")
-                    
-                    # --- BƯỚC 3: TẠO ĐỀ ---
-                    status.write("✍️ Đang viết đề (Strict Mode - Đúng dạng bài)...")
-                    exam_txt, m2 = create_exam_step(clean_bp, subject_name, api_key)
-                    
-                    if exam_txt:
-                        st.session_state['exam_result'] = exam_txt
-                        status.update(label=f"Hoàn tất! (Model: {m2})", state="complete", expanded=False)
-                    else:
-                        status.update(label="Lỗi tạo đề", state="error")
-                        st.error(m2)
-                else:
-                    status.update(label="Lỗi phân tích", state="error")
-                    st.error(m1)
-                    
-            except Exception as e:
-                status.update(label="Lỗi hệ thống", state="error")
-                st.error(str(e))
+                if exam:
+                    st.session_state['result'] = exam
+                    status.update(label="Xong!", state="complete", expanded=False)
+                else: st.error(m2)
+            else: st.error(m1)
 
 with col2:
     st.subheader("2. Kết quả")
-    
-    tab1, tab2 = st.tabs(["📝 Đề thi hoàn chỉnh", "🔍 Cấu trúc phân tích (Debug)"])
+    tab1, tab2 = st.tabs(["📝 Đề thi", "🔍 Cấu trúc JSON"])
     
     with tab2:
         if 'blueprint' in st.session_state:
-            st.caption("Đây là những gì AI đọc được từ file của bạn:")
-            try:
-                # Cố gắng parse JSON để hiển thị đẹp
-                bp_json = st.session_state['blueprint'].replace("```json", "").replace("```", "").strip()
-                st.json(json.loads(bp_json))
-            except:
-                st.text(st.session_state['blueprint'])
-        else:
-            st.info("Chưa có dữ liệu.")
-
+            try: st.json(json.loads(st.session_state['blueprint'].replace("```json","").replace("```","")))
+            except: st.text(st.session_state['blueprint'])
+            
     with tab1:
-        if 'exam_result' in st.session_state:
-            # Cho phép sửa trực tiếp
-            edited_text = st.text_area("Xem và sửa đề trước khi tải:", 
-                                     value=st.session_state['exam_result'], 
-                                     height=700)
-            
-            # Tạo file word
-            doc_file = create_word_doc(edited_text)
-            
-            st.download_button(
-                label="📥 Tải xuống file Word (.docx)",
-                data=doc_file.getvalue(),
-                file_name=f"De_thi_{subject_name.replace(' ', '_')}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary"
-            )
-        else:
-            st.info("Kết quả sẽ hiển thị tại đây.")
+        if 'result' in st.session_state:
+            res_txt = st.text_area("Nội dung:", st.session_state['result'], height=600)
+            doc = create_word_doc(res_txt)
+            st.download_button("📥 Tải Word", doc, f"De_{subject}.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
