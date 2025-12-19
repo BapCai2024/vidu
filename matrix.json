@@ -1,0 +1,66 @@
+{
+  "grade": 3,
+  "subject": "Toán",
+  "semester": "HK1",
+  "time_minutes": 40,
+  "topics": [
+    {
+      "topic_id": "So_hoc",
+      "title": "Số học",
+      "lessons": [
+        {
+          "lesson_id": "L3_T_01",
+          "title": "Đọc, viết và so sánh số đến 100.000",
+          "matrix": {
+            "recognize": { "questions": 3 },
+            "understand": { "questions": 2 },
+            "apply": { "questions": 1 },
+            "allowed_types": ["MCQ", "TrueFalse", "FillBlank", "Essay"]
+          }
+        },
+        {
+          "lesson_id": "L3_T_02",
+          "title": "Cộng, trừ trong phạm vi 10.000",
+          "matrix": {
+            "recognize": { "questions": 3 },
+            "understand": { "questions": 2 },
+            "apply": { "questions": 1 },
+            "allowed_types": ["MCQ", "TrueFalse", "FillBlank", "Essay"]
+          }
+        }
+      ]
+    },
+    {
+      "topic_id": "Giai_toan",
+      "title": "Giải toán có lời văn",
+      "lessons": [
+        {
+          "lesson_id": "L3_T_03",
+          "title": "Dạng toán hơn kém, gấp/giảm số lần",
+          "matrix": {
+            "recognize": { "questions": 2 },
+            "understand": { "questions": 2 },
+            "apply": { "questions": 1 },
+            "allowed_types": ["MCQ", "TrueFalse", "Essay"]
+          }
+        }
+      ]
+    },
+    {
+      "topic_id": "Hinh_hoc",
+      "title": "Hình học cơ bản",
+      "lessons": [
+        {
+          "lesson_id": "L3_T_04",
+          "title": "Hình tròn: tâm, bán kính, đường kính",
+          "matrix": {
+            "recognize": { "questions": 2 },
+            "understand": { "questions": 1 },
+            "apply": { "questions": 1 },
+            "allowed_types": ["MCQ", "FillBlank", "Essay"]
+          }
+        }
+      ]
+    }
+  ]
+}
